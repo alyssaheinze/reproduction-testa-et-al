@@ -1,0 +1,75 @@
+---
+title: "ACTE cold reproduction"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# let us read in the data
+load(file = "df_mtg.rda") # this is only the data for the mturk sample
+
+load(file = "df_qg.rda") # this is the data from qualtrics sample
+
+library(tidyverse)
+
+
+```
+
+## Table 1
+
+Here we try to reproduce Table 1, row 2/3 - the ACTE or "Average Choice-Specific Treatment Effects". There are two: the ACTE of those that avoid the treatment, and the ACTE of those that select the treatment.
+
+Table 1 includes the sample from MTurk.
+
+```{r}
+
+# let us try just with the 'overall' option of ACTE select
+
+acte_select <- function(outcome, treatment, design, avoid, select){
+
+# first get rid of non-missing observations
+treatment <- treatment[!is.na(outcome)]
+outcome <- outcome[!is.na(outcome)]
+design <- design[!is.na(outcome)]
+avoid <- avoid[!is.na(outcome)]
+select <- select[!is.na(outcome)]
+
+# then calculate the first quantity, the average under the choice condition
+choice <- outcome[design == 1]
+avg_choice <- mean(choice)
+
+# then calculate the second quantity, the average under control in the 
+# experimental condition
+expt <- outcome[design == 0]
+expt_control <- expt[treatment == 0]
+avg_control <- mean(expt_control)
+
+# then the last quantity, the proportion of units who seek treatment
+prop_seek_treatment <- length(select)/(length(select)+length(avoid))
+
+# then find the ACTE
+ACTE <- (avg_choice - avg_control) / prop_seek_treatment
+
+return(ACTE)
+
+}
+
+# now we can try to run this on the data 
+# but first we should make some variables with numeric values 
+# so it is easier for them to conform to the function
+
+df_mtg <- df_mtg %>%
+  mutate(design = ifelse(C == 'Choice', 1, 0))
+
+df_mtg <- df_mtg %>%
+  mutate(treat = ifelse(treatment == 'Treatment', 1, 0))
+
+# now we can try for the ACTE 
+ACTE_select <- acte_select(df_mtg$dv_pca_metoo, df_mtg$treat, df_mtg$design, df_mtg$avoid01, df_mtg$select01)
+
+
+```
+

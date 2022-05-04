@@ -1,0 +1,179 @@
+---
+title: "Figure 3 reproduction"
+author: "Matt Easton"
+date: "5/2/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set up
+
+```{r,include=FALSE}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+load("df_mtg.rda")
+
+```
+
+## functions
+
+```{r}
+m_se<-function(ts,ta){
+  #INPUTS
+   # ts: vector of variables of samples who seek out the treatment
+   # ta: vector of variables of samples who avoid the treatment
+  
+  ## difference in means
+  m_ts<-mean(ts,na.rm = TRUE)
+  m_ta<-mean(ta,na.rm = TRUE)
+
+  diff<-m_ts-m_ta
+
+  ## the number of observations in each category 
+  N1 <- length(na.omit(ts))
+  N0 <- length(na.omit(ta))
+  
+  ## variances and standard error
+  var1 <- sum((ts - m_ts)^2,na.rm=T) / (N1 - 1)
+  var0 <- sum((ta - m_ta)^2,na.rm=T) / (N0 - 1)
+  
+  se <- sqrt(var1/N1 + var0/N0)
+  
+  ## Degree of Freedom calculation 
+  df_numerator <- (var1/N1 + var0/N0)^2
+  df_denominator <- (var1^2/(N1^2*(N1-1))) + (var0^2/(N0^2*(N0-1)))
+
+  degrees_free <- df_numerator/df_denominator
+  
+  ll <- diff - qt(.95,degrees_free)*se
+  ul <- diff + qt(.95,degrees_free)*se
+  
+  output<-(c(diff,ll,ul))
+  return(output)}
+
+
+gfun<-function(data_selector,data_avoider){
+  Female<-m_se(data_selector$gender,data_avoider$gender)
+  Non_White<-m_se(data_selector$non_white,data_avoider$non_white)
+  Education<-m_se(data_selector$education,data_avoider$education)
+  Income<-m_se(data_selector$income,data_avoider$income)
+  PID<-m_se(data_selector$pid,data_avoider$pid)
+  Ideology<-m_se(data_selector$ideo,data_avoider$ideo)
+  Me<-m_se(data_selector$fam_movement,data_avoider$fam_movement)
+  Specific<-m_se(data_selector$dv_pca_metoo,data_avoider$dv_pca_metoo)
+  General<-m_se(data_selector$dv_pca_general,data_avoider$dv_pca_general)
+  
+  
+  data<-rbind(Female,Non_White,Education,Income,PID,Ideology,Me,Specific,General) %>%
+    as.data.frame() %>% 
+    rownames_to_column(var = "Covariates")
+  
+  colnames(data)<-c("Covariates","Difference","Lower","Upper")
+  
+  return(data)
+}
+```
+
+## Figure 1
+
+```{r}
+treatment_selector<-filter(df_mtg,balance=="Select Treatment")
+treatment_avoider<-filter(df_mtg,balance=="Avoid Treatment")
+
+data_1<-gfun(treatment_selector,treatment_avoider)
+
+figure5_1<-ggplot(data = data_1,aes(y=Covariates,x=Difference))+
+  geom_point()+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper))+
+  geom_vline(xintercept = 0, linetype="dotted")+
+  theme_bw()
+
+print(figure5_1)
+
+```
+
+
+## Figure 2
+
+```{r}
+# gender analysis
+f_df_mtg<-filter(df_mtg,gender==1)
+
+treatment_selector<-filter(df_mtg,balance=="Select Treatment")
+treatment_avoider<-filter(df_mtg,balance=="Avoid Treatment")
+
+data_2_f<-gfun(treatment_selector,treatment_avoider)
+data_2_f$gender<-"Female" %>% as.factor()
+
+# male analysis
+m_df_mtg<-filter(df_mtg,gender==0)
+
+
+treatment_selector<-filter(m_df_mtg,balance=="Select Treatment")
+treatment_avoider<-filter(m_df_mtg,balance=="Avoid Treatment")
+
+data_2_m<-gfun(treatment_selector,treatment_avoider)
+data_2_m$gender<-"Male" %>% as.factor()
+
+
+# integrating
+data_2<-rbind(data_2_f,data_2_m)
+
+
+figure5_2<-ggplot(data = data_2,aes(y=Covariates,x=Difference))+
+  geom_point(aes(colour=gender),
+             shape = 21, alpha = 0.5, 
+             position=position_jitterdodge())+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper,colour=gender),
+                position=position_jitterdodge())+
+  geom_vline(xintercept = 0, linetype="dotted")+
+  theme_bw()
+
+print(figure5_2)
+```
+
+## Figure 3
+
+```{r}
+# Republican analysis
+R_df_mtg<-filter(df_mtg,Partisanship=="Republicans")
+
+
+treatment_selector<-filter(R_df_mtg,balance=="Select Treatment")
+treatment_avoider<-filter(R_df_mtg,balance=="Avoid Treatment")
+
+data_3_r<-gfun(treatment_selector,treatment_avoider)
+
+data_3_r$partisanship<-"Republicans" %>% as.factor()
+
+# Democrat analysis
+D_df_mtg<-filter(df_mtg,Partisanship=="Democrats")
+
+
+treatment_selector<-filter(D_df_mtg,balance=="Select Treatment")
+treatment_avoider<-filter(D_df_mtg,balance=="Avoid Treatment")
+
+data_3_d<-gfun(treatment_selector,treatment_avoider)
+
+data_3_d$partisanship<-"Democrats" %>% as.factor()
+
+# integrating
+data_3<-rbind(data_3_r,data_3_d)
+
+
+
+figure5_3<-ggplot(data = data_3,aes(y=Covariates,x=Difference))+
+  geom_point(aes(colour=partisanship),
+             shape = 21, alpha = 0.5, 
+             position=position_jitterdodge())+
+  geom_errorbar(aes(xmin=Lower,xmax=Upper,colour=partisanship),
+                position=position_jitterdodge())+
+  geom_vline(xintercept = 0, linetype="dotted")+
+  theme_bw()
+
+print(figure5_3)
+```

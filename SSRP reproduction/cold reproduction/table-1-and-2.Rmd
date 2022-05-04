@@ -1,0 +1,819 @@
+---
+title: "Tables 1 and 2"
+output: pdf_document
+---
+
+
+
+```{r}
+#| include: false 
+#| warning: false
+#| message: false
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(numDeriv)
+library(purrr)
+library(rlang)
+```
+
+# Preliminary steps: Functions
+We write the functions in order to estimate each of the estimands specified by the authors.
+
+## ATE
+We write a function for the average treatment effect.
+```{r}
+# first let's write a function for the ATE
+
+ate <- function(outcome, treatment){
+
+## first get rid of non-missing observations
+treatment <- treatment[!is.na(outcome)]
+outcome <- outcome[!is.na(outcome)]
+
+## then add treated and untreated vectors
+treated <- outcome[treatment == 1]
+not_treated <- outcome[treatment == 0]
+
+## the number of observations in each category 
+N1 <- length(na.omit(treated))
+N0 <- length(na.omit(not_treated))
+
+## Calculate the difference in means 
+mean_treated <- mean(treated)
+mean_control <- mean(not_treated)
+ate <- mean_treated - mean_control
+
+## Standard Error Calculation 
+## Use the usual Neyman Approximation
+var1 <- sum((treated - mean(treated))^2) / (N1 - 1)
+var0 <- sum((not_treated - mean(not_treated))^2) / (N0 - 1)
+
+## Take sqrt to get SE
+se_ate <- sqrt(var1/N1 + var0/N0)
+
+## Degree of Freedom calculation 
+df_numerator <- (var1/N1 + var0/N0)^2
+df_denominator <- (var1^2/(N1^2*(N1-1))) + (var0^2/(N0^2*(N0-1)))
+
+degrees_free <- df_numerator/df_denominator
+
+## Now plug it in with the inverse
+## cdf of the t-distribution qt(x, df)
+
+lwr_bound <- ate - qt(.975, degrees_free)*se_ate
+upp_bound <- ate + qt(.975, degrees_free)*se_ate
+
+## give the output for the ATE
+return(c(ATE = ate,
+         lwr_bound = lwr_bound,
+         upp_bound = upp_bound))
+}
+```
+
+## ACTE
+Let's write a function for the average choice specific treatment effect. This requires a function that incorporates ACTE avoid and ACTE select. 
+
+```{r}
+get_acte <- function(df = df, z = c("Selection", "Control")){
+  
+  #weighted variance function
+  weighted.var <- function(x, w, na.rm = TRUE) {
+  # https://seismo.berkeley.edu/~kirchner/Toolkits/Toolkit_12.pdf 
+    if (na.rm) {
+      i <- !is.na(x)
+        w <- w[i]
+        x <- x[i]
+    }
+    sum.w <- sum(w)
+    sum.w2 <- sum(w^2)
+    mean.w <- sum(x * w) / sum(w)
+    part1 <- (sum(w*x^2, na.rm = T)/sum.w)-mean.w^2
+    part2 <- sum.w2/(sum.w^2 - sum.w2)
+    part1*part2
+}
+  
+#include weights
+  Ns <- df |>
+  mutate(n_c = if_else(C == "Choice",1,0),
+         n_avoid = if_else(C == "Choice"& 
+                             avoid01 ==1,1,0),
+         n_select = if_else(C == "Choice"& 
+                              avoid01 == 0, 1,0),
+         n_control = if_else(D_ch == "Control",1,0),
+         ## Deal with the NAs to not worry about them
+         ## in the next step
+         n_control = if_else(is.na(n_control), 
+                             0, n_control)) |>
+  summarise(
+    n_c = sum(n_c),
+    n_avoid = sum(n_avoid),
+    n_select = sum(n_select),
+    n_control = sum(n_control)) 
+
+  
+weight <- Ns |>
+  summarise(select_weights = 1/(n_select/n_c),
+            avoid_weights = 1/(n_control/n_avoid))
+  
+  acte_weights <- df |>
+    mutate(weights = case_when(
+      C=="Choice" & avoid01 == 0 & D_ch == "Control"~ weight$select_weights,
+      C=="Choice" & avoid01 == 1 & D_ch == "Control"~ weight$avoid_weights,
+      TRUE ~ 1)
+    )
+  
+  ### Get weighted means and weighted SEs 
+  weighted_means_sds <- acte_weights |> 
+    filter(!is.na(treatment),
+           !is.na(dv_pca_metoo)) |>
+    group_by(treatment) |>
+    summarise(avg = sum(weights*dv_pca_metoo, 
+                        na.rm = T)/sum(weights, na.rm =T),
+              se = weighted.var(dv_pca_metoo, 
+                                weights, na.rm = T))
+  
+  ## Get the first part of the expression and its SE 
+  ## This is just the mean and se for the select01 group
+  y_select <- df |>
+    filter(C == "Choice") |>
+    summarise(avg = mean(select01),
+              se = sd(select01)/sqrt(n()))
+  
+  ### Delta Method
+  avg_x <- weighted_means_sds %>%
+    # filter(treatment != "Treatment")%>%
+    # summarise(diff = sum(abs(avg)))%>%
+    summarise(diff = avg[treatment == z[1]] - avg[treatment == z[2]]) %>%
+    pull()
+  
+  x_se <- weighted_means_sds %>% 
+    # filter(treatment != "Treatment")%>%
+    # summarise(se = sqrt(sum(se)))%>%
+    summarise(se = sqrt(sum(se[treatment == z[1]], se[treatment == z[2]]))) %>%
+    pull()
+  
+  denom <- ifelse(z[1] == "Selection", y_select$avg, 1-y_select$avg)
+  
+  # estimate <- avg_x /y_select$avg
+  estimate <- avg_x / denom
+  
+  ## function that we seek to estimate 
+  ## pass this to the jacobian function which calculates the gradient 
+  ratio <- function(x){
+    x[1]/x[2]
+  }
+  
+  ## Variance covariance matrix 
+  vcov <- diag(c(x_se,y_select$se)^2)
+  
+  ## this function by default will output this in 
+  ## transpose form, so take the transpose to match 
+  ## discussion above
+  # grad_g <- t(numDeriv::jacobian(func = ratio, c(avg_x, y_select$avg)))
+  grad_g <- t(numDeriv::jacobian(func = ratio, c(avg_x, denom)))
+  se_b <- sqrt(t(grad_g) %*% vcov %*%grad_g)
+  
+  lwr_b = estimate - qnorm(.975)*se_b 
+  upp_b = estimate + qnorm(.975)*se_b
+  
+  ### SIDE: ALTERNATIVE FUNCTION DELTA METHOD
+  # mvec <- c(x=avg_x, y=denom)
+  # est <- car::deltaMethod(mvec,"x/y",vcov,level=.95)
+  
+  round(c(estimate = estimate, lwr_b = lwr_b, upp_b = upp_b),2)
+  
+}
+```
+
+## CACTE
+Now we write a function for the conditional ACTEs. 
+```{r}
+#let's redefine the ate function but call it CACTE
+
+cacte <- function(outcome, treatment){
+
+## first get rid of non-missing observations
+treatment <- treatment[!is.na(outcome)]
+outcome <- outcome[!is.na(outcome)]
+
+## then add treated and untreated vectors
+treated <- outcome[treatment == 1]
+not_treated <- outcome[treatment == 0]
+
+## the number of observations in each category 
+N1 <- length(na.omit(treated))
+N0 <- length(na.omit(not_treated))
+
+## Calculate the difference in means 
+mean_treated <- mean(treated)
+mean_control <- mean(not_treated)
+ate <- mean_treated - mean_control
+
+## Standard Error Calculation 
+## Use the usual Neyman Approximation
+var1 <- sum((treated - mean(treated))^2) / (N1 - 1)
+var0 <- sum((not_treated - mean(not_treated))^2) / (N0 - 1)
+
+## Take sqrt to get SE
+se_ate <- sqrt(var1/N1 + var0/N0)
+
+## Degree of Freedom calculation 
+df_numerator <- (var1/N1 + var0/N0)^2
+df_denominator <- (var1^2/(N1^2*(N1-1))) + (var0^2/(N0^2*(N0-1)))
+
+degrees_free <- df_numerator/df_denominator
+
+## Now plug it in with the inverse
+## cdf of the t-distribution qt(x, df)
+
+lwr_bound <- ate - qt(.975, degrees_free)*se_ate
+upp_bound <- ate + qt(.975, degrees_free)*se_ate
+
+## give the output for the ATE
+return(c(CACTE = ate,
+         lwr_bound = lwr_bound,
+         upp_bound = upp_bound))
+}
+```
+
+# Table 1
+Now we can move to reproducing the estimates from Table 1, which is conducted on the data set from MTurk. 
+
+## Row 1: ATE
+### Load in the data and create the relevant ATE subsets
+```{r}
+# First we load in the data
+load(file = "df_mtg.rda") 
+
+## Overall
+overall <- df_mtg |> 
+  filter(C == "Experiment") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## Men 
+men <- df_mtg |> 
+  filter(C == "Experiment", gender == 0) |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## women 
+women <- df_mtg |> 
+  filter(C == "Experiment", gender == 1) |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+## Republicans 
+reps <- df_mtg |> 
+  filter(C == "Experiment", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## Democrats 
+dems <- df_mtg |> 
+  filter(C == "Experiment", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+```
+
+### ATE 
+```{r}
+ATEs <- matrix(nrow = 5, ncol = 3)
+colnames(ATEs) <- c("ATE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(ate(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  ATEs[i,1] <- tmp["ATE"]
+  ATEs[i,2] <- tmp["lwr_bound"]
+  ATEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), ATEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = ATE:upp_bound,as.numeric))
+)
+
+```
+
+This fully reproduces row 1 of table 1.
+
+## Row 2 and 3: ACTE select and ACTE avoid
+### Load in the data and create the relevant ACTE subsets
+```{r}
+# First we do the subsets
+## men
+men <- df_mtg |> 
+  filter(gender == 0)
+
+## women 
+women <- df_mtg |> 
+  filter(gender == 1) 
+
+## Republicans 
+reps <- df_mtg |> 
+  filter(Partisanship == "Republicans")
+
+## Democrats 
+dems <- df_mtg |> 
+  filter(Partisanship == "Democrats") 
+```
+### Now we calculate each ACTE 
+```{r}
+dfs <- list(acte, men, women, reps, dems)
+
+# first we get ACTE select
+
+bind_rows(lapply(dfs, get_acte, z = c("Selection", "Control"))) |> 
+  mutate(treatment = c("Overall", "Men", "Women", "Reps", "Dems")) |> 
+  select(treatment, everything()) |>
+  kable()
+
+# second we get ACTE avoid
+
+bind_rows(lapply(dfs, get_acte, z = c("Treatment", "Selection"))) |> 
+  mutate(treatment = c("Overall", "Men", "Women", "Reps", "Dems")) |> 
+  select(treatment, everything()) |>
+  kable()
+```
+## Row 4: CACTE female
+### Load in the data and create the relevant CACTE female subsets
+```{r}
+## Overall
+overall <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control",
+                             0, 1))
+
+overall <- na.omit(overall)
+
+overall <- overall %>% select(-D_ch)
+
+## Men 
+men <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", gender == 0) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+men <- na.omit(men)
+
+men <- men %>% select(-D_ch)
+
+
+## women 
+women <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", gender == 1) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+women <- na.omit(women)
+
+women <- women %>% select(-D_ch)
+
+## Republicans 
+reps <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+reps <- na.omit(reps)
+
+reps <- reps %>% select(-D_ch)
+
+
+
+## Democrats 
+dems <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+dems <- na.omit(dems)
+
+dems <- dems %>% select(-D_ch)
+```
+### Calculate CACTE female
+```{r}
+CACTEs <- matrix(nrow = 5, ncol = 3)
+colnames(CACTEs) <- c("CACTE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(cacte(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  CACTEs[i,1] <- tmp["CACTE"]
+  CACTEs[i,2] <- tmp["lwr_bound"]
+  CACTEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), CACTEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = CACTE:upp_bound,as.numeric))
+)
+```
+This fully reproduces row 4 of Table 1.
+
+## Row 5: CACTE male
+### Load in the data and create the relevant CACTE male subsets
+```{r}
+load(file = "df_mtg.rda") 
+
+## Overall
+overall <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control",
+                             0, 1))
+
+overall <- na.omit(overall)
+
+overall <- overall %>% select(-D_ch)
+
+## Men 
+men <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", gender == 0) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+men <- na.omit(men)
+
+men <- men %>% select(-D_ch)
+
+
+## women 
+women <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", gender == 1) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+women <- na.omit(women)
+
+women <- women %>% select(-D_ch)
+
+## Republicans 
+reps <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+reps <- na.omit(reps)
+
+reps <- reps %>% select(-D_ch)
+
+
+
+## Democrats 
+dems <- df_mtg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+dems <- na.omit(dems)
+
+dems <- dems %>% select(-D_ch)
+```
+
+### Calculate CACTE male
+```{r}
+## now let's run it over each subsetted dataset 
+
+CACTEs <- matrix(nrow = 5, ncol = 3)
+colnames(CACTEs) <- c("CACTE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(cacte(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  CACTEs[i,1] <- tmp["CACTE"]
+  CACTEs[i,2] <- tmp["lwr_bound"]
+  CACTEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), CACTEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = CACTE:upp_bound,as.numeric))
+)
+```
+This fully replicates the last row of Table 1.
+
+# Table 2
+Now we can move to reproducing the estimates from Table 2, which is conducted on the data set from Qualtrics.
+
+## Row 1: ATE
+### Load in the data and create the relevant ATE subsets
+```{r}
+# First we load in the data
+load(file = "df_qg.rda") 
+
+## Overall
+overall <- df_qg |> 
+  filter(C == "Experiment") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## Men 
+men <- df_qg |> 
+  filter(C == "Experiment", gender == 0) |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## women 
+women <- df_qg |> 
+  filter(C == "Experiment", gender == 1) |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+## Republicans 
+reps <- df_qg |> 
+  filter(C == "Experiment", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+
+## Democrats 
+dems <- df_qg |> 
+  filter(C == "Experiment", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, treatment) |>
+  mutate(treatment = if_else(treatment == "Control", 
+                             0, 1))
+```
+
+### ATE 
+```{r}
+ATEs <- matrix(nrow = 5, ncol = 3)
+colnames(ATEs) <- c("ATE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(ate(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  ATEs[i,1] <- tmp["ATE"]
+  ATEs[i,2] <- tmp["lwr_bound"]
+  ATEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), ATEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = ATE:upp_bound,as.numeric))
+)
+
+```
+This fully reproduces row 1 from table 2.
+
+## Row 2 and 3: ACTE
+### Load in the data and create the relevant ACTE subsets
+```{r}
+# First we do the subsets
+## men
+men <- df_qg |> 
+  filter(gender == 0)
+
+## women 
+women <- df_qg |> 
+  filter(gender == 1) 
+
+## Republicans 
+reps <- df_qg |> 
+  filter(Partisanship == "Republicans")
+
+## Democrats 
+dems <- df_qg |> 
+  filter(Partisanship == "Democrats") 
+```
+### Now we calculate each ACTE 
+```{r}
+
+dfs <- list(df_qg, men, women, reps, dems)
+
+# first we get ACTE select
+
+bind_rows(lapply(dfs, get_acte, z = c("Selection", "Control"))) |> 
+  mutate(treatment = c("Overall", "Men", "Women", "Reps", "Dems")) |> 
+  select(treatment, everything()) |>
+  kable()
+
+# second we get ACTE avoid
+
+bind_rows(lapply(dfs, get_acte, z = c("Treatment", "Selection"))) |> 
+  mutate(treatment = c("Overall", "Men", "Women", "Reps", "Dems")) |> 
+  select(treatment, everything()) |>
+  kable()
+```
+This reproduces the results from ACTE select and avoid treatments. 
+
+## Row 4: CACTE female
+### Load in the data and create the relevant CACTE female subsets
+```{r}
+## Overall
+overall <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control",
+                             0, 1))
+
+overall <- na.omit(overall)
+
+overall <- overall %>% select(-D_ch)
+
+## Men 
+men <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", gender == 0) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+men <- na.omit(men)
+
+men <- men %>% select(-D_ch)
+
+
+## women 
+women <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", gender == 1) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+women <- na.omit(women)
+
+women <- women %>% select(-D_ch)
+
+## Republicans 
+reps <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+reps <- na.omit(reps)
+
+reps <- reps %>% select(-D_ch)
+
+
+
+## Democrats 
+dems <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Female", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+dems <- na.omit(dems)
+
+dems <- dems %>% select(-D_ch)
+```
+### Calculate CACTE female
+```{r}
+CACTEs <- matrix(nrow = 5, ncol = 3)
+colnames(CACTEs) <- c("CACTE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(cacte(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  CACTEs[i,1] <- tmp["CACTE"]
+  CACTEs[i,2] <- tmp["lwr_bound"]
+  CACTEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), CACTEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = CACTE:upp_bound,as.numeric))
+)
+```
+This fully reproduces row 4 of Table 2.
+
+## Row 5: CACTE male
+### Load in the data and create the relevant CACTE male subsets
+```{r}
+load(file = "df_qg.rda") 
+
+## Overall
+overall <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control",
+                             0, 1))
+
+overall <- na.omit(overall)
+
+overall <- overall %>% select(-D_ch)
+
+## Men 
+men <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", gender == 0) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+men <- na.omit(men)
+
+men <- men %>% select(-D_ch)
+
+
+## women 
+women <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", gender == 1) |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+women <- na.omit(women)
+
+women <- women %>% select(-D_ch)
+
+## Republicans 
+reps <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", 
+         Partisanship == "Republicans") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+reps <- na.omit(reps)
+
+reps <- reps %>% select(-D_ch)
+
+
+
+## Democrats 
+dems <- df_qg |> 
+  filter(C == "Choice" & D_ch == "Control"|D_ch == "Male", 
+         Partisanship == "Democrats") |>
+  select(dv_pca_metoo, D_ch) |>
+  mutate(treatment = if_else(D_ch == "Control", 
+                             0, 1))
+
+dems <- na.omit(dems)
+
+dems <- dems %>% select(-D_ch)
+```
+
+### Calculate CACTE male
+```{r}
+## now let's run it over each subsetted dataset 
+
+CACTEs <- matrix(nrow = 5, ncol = 3)
+colnames(CACTEs) <- c("CACTE", "lwr_bound", "upp_bound")
+dfs <- list(overall, men, women, reps, dems)
+
+
+for(i in 1:length(dfs)){
+  tmp <- round(cacte(dfs[[i]]$dv_pca_metoo,
+             dfs[[i]]$treatment),2)
+  CACTEs[i,1] <- tmp["CACTE"]
+  CACTEs[i,2] <- tmp["lwr_bound"]
+  CACTEs[i,3] <- tmp["upp_bound"]
+}
+
+kable(cbind(Treatments = c("Overall", "Men", 
+                     "Women", "Republicans",
+                     "Democrats"), CACTEs) |> 
+  as.data.frame() |> 
+  mutate(across(.cols = CACTE:upp_bound,as.numeric))
+)
+```
+We have the last row of Table 2.
